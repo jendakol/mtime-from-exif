@@ -1,12 +1,20 @@
+#[macro_use]
+extern crate clap;
+
 use std::time::SystemTime;
 
 use filetime::FileTime;
+use rayon::prelude::*;
 use regex::Regex;
 use rexif::ExifTag;
 use walkdir::{DirEntry, WalkDir};
 
-fn handle_file(de: DirEntry) -> () {
+fn handle_file(de: DirEntry, verbosity: u8) -> () {
     let re = Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
+
+    if verbosity >= 3 {
+        println!("Going to handle file {:?}", de.path())
+    }
 
     match rexif::parse_file(de.path()) {
         Ok(exif) => {
@@ -14,6 +22,11 @@ fn handle_file(de: DirEntry) -> () {
                 .find(|e| e.tag == ExifTag::DateTimeOriginal) {
                 Some(entry) => {
                     let entry = entry.value.to_string();
+
+                    if verbosity >= 2 {
+                        println!("Going to handle file {:?}", de.path())
+                    }
+
                     let caps = re.captures(entry.as_ref()).unwrap();
 
                     let mtime = format!(
@@ -29,7 +42,9 @@ fn handle_file(de: DirEntry) -> () {
                     let mtime: SystemTime = mtime.parse::<humantime::Timestamp>().unwrap().into();
                     let mtime: FileTime = FileTime::from(mtime);
 
-                    println!("{:?} ({:?}) -> {:?}", de.path(), FileTime::from_last_modification_time(&std::fs::metadata(de.path()).unwrap()).unix_seconds(), mtime.unix_seconds());
+                    if verbosity >= 1 {
+                        println!("Changing file {:?} ({:?}) -> {:?}", de.path(), FileTime::from_last_modification_time(&std::fs::metadata(de.path()).unwrap()).unix_seconds(), mtime.unix_seconds());
+                    }
 
                     filetime::set_file_mtime(de.path(), mtime).unwrap();
                 },
@@ -41,16 +56,31 @@ fn handle_file(de: DirEntry) -> () {
 }
 
 fn main() {
-    let root_dir = std::env::args().skip(1).next().unwrap_or("Root dir path was not provided".to_string());
+    let matches = clap_app!(myapp =>
+        (version: "0.2")
+        (author: "Jenda K. <jendakolena@gmail.com>")
+        (about: "Changes JPG's mtime to DateTimeOriginal from their EXIF")
+        (@arg PARALLELISM: -p --parallelism +takes_value "Sets parallelism value")
+        (@arg DIR: +required "Working dir")
+        (@arg VERBOSITY: -v ... "Sets the level of verbosity")
+    )
+        .get_matches();
 
-    println!("Working dir: {}", root_dir);
+    let root_dir = matches.value_of("DIR").unwrap_or_else(|| panic!("Working dir must have been provided"));
+    let parallelism = value_t!(matches, "PARALLELISM", usize).unwrap_or(4);
+    let verbosity = matches.occurrences_of("VERBOSITY") as u8;
+
+    println!("Working in {} with parallelism {}", root_dir, parallelism);
+
+    rayon::ThreadPoolBuilder::new().num_threads(parallelism).build_global().unwrap();
 
     WalkDir::new(root_dir)
         .same_file_system(true)
         .follow_links(false)
         .into_iter()
+        .par_bridge()
         .map(|f| f.unwrap())
         .filter(|f| f.path().metadata().unwrap().file_type().is_file())
         .filter(|f| f.path().file_name().unwrap().to_str().unwrap().to_lowercase().ends_with("jpg"))
-        .for_each(handle_file);
+        .for_each(|f| handle_file(f, verbosity));
 }
